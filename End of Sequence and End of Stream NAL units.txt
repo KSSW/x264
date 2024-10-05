@@ -1,0 +1,174 @@
+>From 0f879605935b5548391d9a3eb675d376c7afd863 Mon Sep 17 00:00:00 2001
+From: Niranjan <niranjan at multicorewareinc.com>
+Date: Thu, 8 Apr 2021 00:37:54 +0530
+Subject: [PATCH 1/1] Add: End of Sequence and End of Stream NAL units
+
+---
+ common/base.c     |  6 ++++++
+ encoder/encoder.c | 31 +++++++++++++++++++++++++++++++
+ x264.c            |  4 ++++
+ x264.h            | 10 ++++++++++
+ 4 files changed, 51 insertions(+)
+
+diff --git a/common/base.c b/common/base.c
+index ee893b1..f3a347a 100644
+--- a/common/base.c
++++ b/common/base.c
+@@ -469,6 +469,8 @@ REALIGN_STACK void x264_param_default( x264_param_t
+*param )
+     param->b_repeat_headers = 1;
+     param->b_annexb = 1;
+     param->b_aud = 0;
++    param->b_eob = 0;
++    param->b_eos = 0;
+     param->b_vfr_input = 1;
+     param->i_nal_hrd = X264_NAL_HRD_NONE;
+     param->b_tff = 1;
+@@ -1338,6 +1340,10 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p,
+const char *name, const cha
+         p->analyse.b_ssim = atobool(value);
+     OPT("aud")
+         p->b_aud = atobool(value);
++    OPT("eob")
++        p->b_eob = atobool(value);
++    OPT("eos")
++        p->b_eos = atobool(value);
+     OPT("sps-id")
+         p->i_sps_id = atoi(value);
+     OPT("global-header")
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index bd1ff7c..04784e2 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1322,6 +1322,8 @@ static int validate_parameters( x264_t *h, int b_open
+)
+     BOOLIFY( b_interlaced );
+     BOOLIFY( b_intra_refresh );
+     BOOLIFY( b_aud );
++    BOOLIFY( b_eob );
++    BOOLIFY( b_eos );
+     BOOLIFY( b_repeat_headers );
+     BOOLIFY( b_annexb );
+     BOOLIFY( b_vfr_input );
+@@ -3541,6 +3543,14 @@ int     x264_encoder_encode( x264_t *h,
+         h->out.i_nal = 0;
+     }
+
++    if (h->param.b_eos && h->fenc->i_type == X264_TYPE_IDR &&
+h->fenc->i_frame)
++    {
++        nal_start(h, NAL_EOS, NAL_PRIORITY_DISPOSABLE);
++        if (nal_end(h))
++            return -1;
++        overhead += h->out.nal[h->out.i_nal - 1].i_payload + NALU_OVERHEAD;
++    }
++
+     if( h->param.b_aud )
+     {
+         int pic_type;
+@@ -3959,6 +3969,27 @@ static int encoder_frame_end( x264_t *h, x264_t
+*thread_current,
+         }
+     }
+
++    if (!x264_encoder_delayed_frames(h))
++    {
++        int endNalUnit[2];
++        endNalUnit[0] = h->param.b_eos;
++        endNalUnit[1] = h->param.b_eob;
++        for (int i = 0; i < 2; i++)
++        {
++            int nalType = i == 0 ? NAL_EOS : NAL_EOB;
++            if (endNalUnit[i])
++            {
++                nal_start(h, nalType, NAL_PRIORITY_DISPOSABLE);
++                if (nal_end(h))
++                    return -1;
++                int total_size = encoder_encapsulate_nals(h, h->out.i_nal
+- 1);
++                if (total_size < 0)
++                    return -1;
++                frame_size += total_size;
++            }
++        }
++    }
++
+     /* End bitstream, set output  */
+     *pi_nal = h->out.i_nal;
+     *pp_nal = h->out.nal;
+diff --git a/x264.c b/x264.c
+index 5ead60b..3fc49ee 100644
+--- a/x264.c
++++ b/x264.c
+@@ -947,6 +947,8 @@ static void help( x264_param_t *defaults, int longhelp )
+     H2( "      --dump-yuv <string>     Save reconstructed frames\n" );
+     H2( "      --sps-id <integer>      Set SPS and PPS id numbers [%d]\n",
+defaults->i_sps_id );
+     H2( "      --aud                   Use access unit delimiters\n" );
++    H2( "      --eob                   Use end of stream\n" );
++    H2( "      --eos                   Use end of sequence\n" );
+     H2( "      --force-cfr             Force constant framerate timestamp
+generation\n" );
+     H2( "      --tcfile-in <string>    Force timestamp generation with
+timecode file\n" );
+     H2( "      --tcfile-out <string>   Output timecode v2 file from input
+timestamps\n" );
+@@ -1129,6 +1131,8 @@ static struct option long_options[] =
+     { "dump-yuv",    required_argument, NULL, 0 },
+     { "sps-id",      required_argument, NULL, 0 },
+     { "aud",               no_argument, NULL, 0 },
++    { "eob",               no_argument, NULL, 0 },
++    { "eos",               no_argument, NULL, 0 },
+     { "nr",          required_argument, NULL, 0 },
+     { "cqm",         required_argument, NULL, 0 },
+     { "cqmfile",     required_argument, NULL, 0 },
+diff --git a/x264.h b/x264.h
+index 29f5315..a754abf 100644
+--- a/x264.h
++++ b/x264.h
+@@ -95,6 +95,8 @@ enum nal_unit_type_e
+     NAL_SPS         = 7,
+     NAL_PPS         = 8,
+     NAL_AUD         = 9,
++    NAL_EOS         = 10,
++    NAL_EOB         = 11,
+     NAL_FILLER      = 12,
+     /* ref_idc == 0 for 6,9,10,11,12 */
+ };
+@@ -586,6 +588,14 @@ typedef struct x264_param_t
+
+     /* For internal use only */
+     void *opaque;
++
++    /* Flag indicating whether the encoder should emit an End of Bitstream
++    * NAL at the end of bitstream. Default disabled */
++    int      b_eob;
++
++    /* Flag indicating whether the encoder should emit an End of Sequence
++     * NAL at the end of every Coded Video Sequence. Default disabled */
++    int      b_eos;
+ } x264_param_t;
+
+ X264_API void x264_nal_encode( x264_t *h, uint8_t *dst, x264_nal_t *nal );
+-- 
+1.8.3.1
+
+
+-- 
+
+Thanks & Regards
+*Niranjan Kumar B*
+Video Codec Engineer
+Media & AI Analytics
++91 958 511 1449
+<https://multicorewareinc.com/>
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://mailman.videolan.org/pipermail/x264-devel/attachments/20210408/1ba1700c/attachment.html>
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: Add-End-of-Sequence-and-End-of-Stream-NAL-units.patch
+Type: application/octet-stream
+Size: 5106 bytes
+Desc: not available
+URL: <http://mailman.videolan.org/pipermail/x264-devel/attachments/20210408/1ba1700c/attachment.obj>
